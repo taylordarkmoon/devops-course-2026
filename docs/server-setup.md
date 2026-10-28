@@ -41,7 +41,7 @@
 | Имя | Группы | Способ аутентификации |
 |---|---|---|
 | `student` | student, adm, cdrom, **sudo**, dip, plugdev, lxd | Пароль; только локальная консоль (по SSH вход запрещён директивой `AllowUsers devops`) |
-| `devops` | devops, **sudo**, users | Только по ключу ED25519 (`~/.ssh/devops_vm` на хосте); пароль используется для `sudo` |
+| `devops` | devops, **sudo**, users, **docker** | Только по ключу ED25519 (`~/.ssh/devops_vm` на хосте); пароль используется для `sudo` |
 
 Ключ клиента — отдельная пара для сервера (не ключ из ПР № 1):
 
@@ -115,6 +115,7 @@ Host devops.local
 | `02-keys-configured` | 28.10.2026 01:52 | Пользователь `devops`, вход по ключу, `~/.ssh/config` |
 | `03-ssh-hardened` | 28.10.2026 02:17 | Усиление SSH, порт 2222, проброс 2222 → 2222 |
 | `04-nginx-https` | 28.10.2026 14:56 | Nginx, HTTPS с самоподписанным сертификатом, перенаправление HTTP → HTTPS |
+| `05-docker-compose` | 28.10.2026 22:40 | Docker Engine, проект `~/app` (приложение + PostgreSQL), том `app_db_data`, порт `127.0.0.1:5000` |
 
 ## 8. Веб-сервер
 
@@ -133,6 +134,48 @@ sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/privat
 
 - Межсетевой экран: порты 80 и 443 разрешены правилами из раздела 6, профили `Nginx Full` не добавлялись.
 - Хостовая система: доставка выполняется из WSL версии 1 (Ubuntu, `rsync`); в WSL скопированы `~/.ssh/devops_vm`, `~/.ssh/config` (права 600) и сертификат `~/devops.crt` для проверки `curl --cacert`. Для браузера в исключения системного прокси Windows добавлен `devops.local` (иначе запросы уходят в прокси VPN и возвращают 503).
+
+## 9. Контейнеризация
+
+- **Docker Engine 29.9.2 (Community)** установлен из официального репозитория Docker по инструкции docs.docker.com (команды — шаг 10 раздела восстановления); пакет `docker.io` из репозитория Ubuntu не используется. Ключ репозитория — `/etc/apt/keyrings/docker.asc`, источник — `/etc/apt/sources.list.d/docker.list` (`https://download.docker.com/linux/ubuntu noble stable`).
+- Пакеты: `docker-ce`, `docker-ce-cli` 29.9.2, `containerd.io` 2.4.2, `docker-buildx-plugin` 0.38.1, `docker-compose-plugin` 5.6.1 (Docker Compose v5.6.1). Службы `docker` и `containerd` включены (`enabled`) и запускаются при загрузке.
+- Группа `docker`: только `devops`. Участник группы фактически имеет права root (может смонтировать `/` хоста в контейнер), поэтому в группу включаются только учётные записи с правом `sudo`; `student` в группу не входит.
+- Проект: `/home/devops/app` (`~/app`), владелец `devops`, файлы `644`. Источник — каталог `app/` репозитория, доставка с хоста (WSL) из корня репозитория: `rsync -avz --delete --exclude=.env app/ devops:app/`. Имя проекта Compose — `app` (по имени каталога).
+
+| Файл | Назначение |
+|---|---|
+| `app.py`, `requirements.txt` | Приложение Flask (счётчик посещений в PostgreSQL), `gunicorn` |
+| `Dockerfile` | `python:3.12-slim`, системный пользователь `app` (процесс не от root), `EXPOSE 5000`, `CMD` в exec-форме |
+| `.dockerignore` | `.env`, `__pycache__/`, `*.pyc` — не попадают в контекст сборки |
+| `docker-compose.yml` | Сервисы `db` (`postgres:16-alpine`, healthcheck `pg_isready`) и `app` (образ `devops-app:1.0`, `depends_on: db: condition: service_healthy`); `restart: unless-stopped` |
+| `.env.example` | Шаблон переменных (`POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD=change_me`, `DB_HOST=db`) |
+
+- Файл `.env`: `/home/devops/app/.env`, владелец `devops:devops`, права **600**. Создаётся только на сервере из `.env.example`, пароль СУБД — `openssl rand -hex 16`. Не копируется на хост и исключён из репозитория (`.gitignore`), из образа (`.dockerignore`) и из доставки (`--exclude=.env`, иначе `--delete` удалит его).
+- Публикуемые порты:
+
+| Сервис | Порт контейнера | Публикация | Кто обращается |
+|---|---|---|---|
+| `app` | `5000/tcp` | `127.0.0.1:5000` (`docker-proxy`) | Только Nginx на этом же сервере |
+| `db` | `5432/tcp` | не публикуется | Только `app` через сеть проекта |
+
+  Правила UFW для 5000 и 5432 не добавлялись: опубликованные порты обрабатываются правилами iptables Docker (цепочка `DOCKER` таблицы `nat`) до правил UFW, поэтому порт, опубликованный на `0.0.0.0`, доступен из сети независимо от UFW. Ограничение задаётся адресом публикации `127.0.0.1`.
+- Сеть: `app_backend` (bridge, `172.18.0.0/16`); приложение находит СУБД по имени сервиса `db` через встроенный DNS Docker (`DB_HOST=db`).
+- Именованный том: `app_db_data` → `/var/lib/postgresql/data` в контейнере (на сервере `/var/lib/docker/volumes/app_db_data/_data`). `docker compose down` том сохраняет, `docker compose down -v` удаляет данные без возможности восстановления — на рабочем сервере не применяется. Тег `16-alpine` фиксирует основную версию PostgreSQL (формат данных между основными версиями несовместим).
+- Обратный прокси-сервер: в блок HTTPS `/etc/nginx/sites-available/devops-site` (копия — `nginx/devops-site.conf`) добавлено расположение; статический ресурс `/` сохранён.
+
+```
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+  Завершающий `/` в `proxy_pass` заменяет префикс `/app/` на `/` (`/app/health` → `/health`). Если приложение не принимает соединения, Nginx возвращает `502 Bad Gateway` и пишет в `devops-site.error.log` запись `connect() failed (111: Connection refused) while connecting to upstream`.
+- Управление (в `~/app`): `docker compose up -d --build`, `docker compose ps`, `docker compose logs app`, `docker compose stop app` / `start app`.
+- Проверка: раздел `[5] Контейнеризация` сценария `scripts/audit.sh` (служба docker активна, `app-db-1` — healthy, порты 5000 и 5432 только на `127.0.0.1`, права `.env` — 600).
 
 ## Восстановление конфигурации со снимка 01-clean-install
 
@@ -219,4 +262,36 @@ scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
 scripts/deploy.sh
 ```
 
-**10.** Проверка: `scripts/audit.sh` на сервере завершается с кодом 0.
+**10. [VM]** Docker Engine из официального репозитория (раздел 9):
+
+```
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops
+exit
+```
+
+В новой SSH-сессии: `docker version` (раздел `Server` присутствует), `docker compose version`, `docker run --rm hello-world`.
+
+**11. [Хост, WSL; VM]** Проект (из корня репозитория):
+
+```
+rsync -avz --delete --exclude=.env app/ devops:app/
+```
+
+```
+cd ~/app && cp .env.example .env && chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+docker compose up -d --build
+docker compose ps
+curl --cacert ~/devops.crt https://devops.local/app/      # [Хост, WSL]
+```
+
+Конфигурация Nginx с расположением `/app/` уже применена на шаге 9.
+
+**12.** Проверка: `scp scripts/audit.sh devops:~/audit.sh`, затем `~/audit.sh` на сервере завершается с кодом 0.
