@@ -114,8 +114,27 @@ Host devops.local
 | `01-clean-install` | 28.10.2026 01:11 | Чистая установка, `apt upgrade`, ключи хоста сгенерированы (`ssh-keygen -A`), SSH на порту 22 |
 | `02-keys-configured` | 28.10.2026 01:52 | Пользователь `devops`, вход по ключу, `~/.ssh/config` |
 | `03-ssh-hardened` | 28.10.2026 02:17 | Усиление SSH, порт 2222, проброс 2222 → 2222 |
+| `04-nginx-https` | 28.10.2026 14:56 | Nginx, HTTPS с самоподписанным сертификатом, перенаправление HTTP → HTTPS |
 
-## 8. Восстановление конфигурации со снимка 01-clean-install
+## 8. Веб-сервер
+
+- Пакет: `nginx` (1.24.0, из репозитория Ubuntu): `sudo apt install -y nginx`. Главный процесс — root, рабочие — `www-data`.
+- Конфигурация ресурса: `/etc/nginx/sites-available/devops-site` (копия — `nginx/devops-site.conf` в репозитории), активирована ссылкой в `/etc/nginx/sites-enabled/`. Стандартный ресурс отключён удалением ссылки `/etc/nginx/sites-enabled/default` (файл в `sites-available` сохранён).
+- Два блока `server`: порт 80 — `return 301 https://$host$request_uri;`; порт 443 — `ssl`, `ssl_protocols TLSv1.2 TLSv1.3`, `root /var/www/devops-site`, `try_files $uri $uri/ =404`, `error_page 404 /404.html`. Заголовок HSTS не добавляется.
+- Журналы: `/var/log/nginx/devops-site.access.log`, `/var/log/nginx/devops-site.error.log` (запросы блока перенаправления — в `/var/log/nginx/access.log`).
+- Применение изменений: только `sudo nginx -t && sudo systemctl reload nginx`.
+- Каталог ресурса: `/var/www/devops-site`, владелец `devops:devops`, каталоги `755`, файлы `644` («владелец пишет, веб-сервер читает»). Содержимое доставляется из каталога `site/` репозитория сценарием `scripts/deploy.sh` (`rsync -avz --delete --chmod=D755,F644`, одно SSH-соединение).
+- Сертификат: `/etc/ssl/certs/devops.crt`, root, `644`. Закрытый ключ: `/etc/ssl/private/devops.key`, root, `600` (за пределы `/etc/ssl/private` и в репозиторий не копируется).
+- Формирование (срок 365 дней, действует с 28.10.2026 по 28.10.2027):
+
+```
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/devops.key -out /etc/ssl/certs/devops.crt -subj "/CN=devops.local" -addext "subjectAltName=DNS:devops.local"
+```
+
+- Межсетевой экран: порты 80 и 443 разрешены правилами из раздела 6, профили `Nginx Full` не добавлялись.
+- Хостовая система: доставка выполняется из WSL версии 1 (Ubuntu, `rsync`); в WSL скопированы `~/.ssh/devops_vm`, `~/.ssh/config` (права 600) и сертификат `~/devops.crt` для проверки `curl --cacert`. Для браузера в исключения системного прокси Windows добавлен `devops.local` (иначе запросы уходят в прокси VPN и возвращают 503).
+
+## Восстановление конфигурации со снимка 01-clean-install
 
 Порядок операций важен: действующая SSH-сессия не закрывается, пока новая конфигурация не проверена во втором окне; разрешающее правило UFW создаётся до включения экрана.
 
@@ -183,4 +202,21 @@ sudo sed -i 's/^127.0.1.1.*/127.0.1.1 devops-vm.devops.local devops-vm/' /etc/ho
 hostname -f
 ```
 
-**8.** Проверка: `scripts/audit.sh` завершается с кодом 0.
+**8. [VM]** Веб-сервер (раздел 8):
+
+```
+sudo apt update && sudo apt install -y nginx
+sudo mkdir -p /var/www/devops-site && sudo chown -R devops:devops /var/www/devops-site
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/devops.key -out /etc/ssl/certs/devops.crt -subj "/CN=devops.local" -addext "subjectAltName=DNS:devops.local"
+```
+
+**9. [Хост, WSL]** Конфигурация ресурса и содержимое (из корня репозитория):
+
+```
+scp nginx/devops-site.conf devops:~/devops-site.conf
+ssh -t devops "sudo cp ~/devops-site.conf /etc/nginx/sites-available/devops-site && sudo ln -sf /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/ && sudo rm -f /etc/nginx/sites-enabled/default && sudo nginx -t && sudo systemctl reload nginx"
+scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
+scripts/deploy.sh
+```
+
+**10.** Проверка: `scripts/audit.sh` на сервере завершается с кодом 0.
